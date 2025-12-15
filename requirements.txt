@@ -8,3 +8,10 @@ huggingface-hub
 scikit-learn
 scipy
 pytz
+streamlit
+pandas
+numpy
+yahooquery
+statsmodels
+requests
+scikit-learn
