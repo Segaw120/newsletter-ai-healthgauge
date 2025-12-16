@@ -469,7 +469,7 @@ def build_newsletter_prompt(asset: str, signal_data: dict, merged_df: pd.DataFra
     latest = merged_df.iloc[-1]
     close_col = "close" if "close" in latest else "Close"
     
-    prompt = f\"\"\"Write a concise professional market analysis for {asset.split(' - ')[0]}.
+    prompt = f"""Write a concise professional market analysis for {asset.split(' - ')[0]}.
 
 Current Data:
 - Price: ${latest.get(close_col, 0):.2f}
@@ -484,7 +484,7 @@ Write a 3-paragraph analysis covering:
 2. Key technical and COT indicators
 3. Trading outlook and risk factors
 
-Keep it professional and actionable. No fluff.\"\"\"
+Keep it professional and actionable. No fluff."""
     
     return prompt.strip()
 
