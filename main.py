@@ -5,14 +5,11 @@ import datetime
 import time
 import os
 import logging
-import threading
 import plotly.graph_objects as go
-import plotly.express as px
+from plotly.subplots import make_subplots
 from sodapy import Socrata
 from yahooquery import Ticker
 from huggingface_hub import InferenceClient
-from sklearn.linear_model import LinearRegression
-from sklearn.ensemble import RandomForestRegressor
 from scipy import stats
 
 # --- Logging ---
@@ -23,11 +20,15 @@ logger = logging.getLogger(__name__)
 SODAPY_APP_TOKEN = "PP3ezxaUTiGforvvbBUGzwRx7"
 client = Socrata("publicreporting.cftc.gov", SODAPY_APP_TOKEN, timeout=60)
 
-# Initialize HF client once, expects HF_TOKEN in environment
-hf_client = InferenceClient(provider="cerebras", api_key=os.getenv("HF_TOKEN"))
+# Initialize HF client once
+try:
+    hf_client = InferenceClient(api_key=os.getenv("HF_TOKEN"))
+except:
+    hf_client = None
+    logger.warning("HF client not initialized - newsletter generation may not work")
 
 # --- Asset mapping (COT market names -> Yahoo futures tickers) ---
-assets = {
+ASSET_MAPPING = {
     "GOLD - COMMODITY EXCHANGE INC.": "GC=F",
     "SILVER - COMMODITY EXCHANGE INC.": "SI=F",
     "PLATINUM - NEW YORK MERCANTILE EXCHANGE": "PL=F",
@@ -41,16 +42,14 @@ assets = {
     "JAPANESE YEN - CHICAGO MERCANTILE EXCHANGE": "6J=F",
     "SWISS FRANC - CHICAGO MERCANTILE EXCHANGE": "6S=F",
     "BITCOIN - CHICAGO MERCANTILE EXCHANGE": "BTC=F",
-    "MICRO BITCOIN - CHICAGO MERCANTILE EXCHANGE": "MBT=F",
-    "MICRO ETHER - CHICAGO MERCANTILE EXCHANGE": "ETH=F",
     "E-MINI S&P FINANCIAL INDEX - CHICAGO MERCANTILE EXCHANGE": "ES=F",
-    "DOW JONES U.S. REAL ESTATE IDX - CHICAGO BOARD OF TRADE": "DJR",
     "NATURAL GAS - NEW YORK MERCANTILE EXCHANGE": "NG=F",
     "CORN - CHICAGO BOARD OF TRADE": "ZC=F",
     "SOYBEANS - CHICAGO BOARD OF TRADE": "ZS=F",
 }
 
 # --- Fetch COT Data ---
+@st.cache_data(ttl=3600)
 def fetch_cot_data(market_name: str, max_attempts: int = 3) -> pd.DataFrame:
     logger.info(f"Fetching COT data for {market_name}")
     where_clause = f'market_and_exchange_names="{market_name}"'
@@ -76,21 +75,20 @@ def fetch_cot_data(market_name: str, max_attempts: int = 3) -> pd.DataFrame:
                     df["commercial_net"] = df["commercial_long"] - df["commercial_short"]
                     df["non_commercial_net"] = df["non_commercial_long"] - df["non_commercial_short"]
                     
-                    # Calculate commercial position index (0-100)
+                    # Calculate position percentages
                     df["commercial_position_pct"] = (df["commercial_long"] / 
                                                     (df["commercial_long"] + df["commercial_short"])) * 100
-                    
-                    # Calculate non-commercial position index (0-100)
                     df["non_commercial_position_pct"] = (df["non_commercial_long"] / 
                                                         (df["non_commercial_long"] + df["non_commercial_short"])) * 100
                     
-                    # Calculate z-scores for positioning extremes
+                    # Calculate z-scores
                     df["commercial_net_zscore"] = (df["commercial_net"] - 
                                                  df["commercial_net"].rolling(52).mean()) / df["commercial_net"].rolling(52).std()
                     df["non_commercial_net_zscore"] = (df["non_commercial_net"] - 
                                                      df["non_commercial_net"].rolling(52).mean()) / df["non_commercial_net"].rolling(52).std()
                     
-                except KeyError:
+                except KeyError as e:
+                    logger.warning(f"Missing COT columns for {market_name}: {e}")
                     df["commercial_net"] = 0.0
                     df["non_commercial_net"] = 0.0
                     df["commercial_position_pct"] = 50.0
@@ -109,9 +107,13 @@ def fetch_cot_data(market_name: str, max_attempts: int = 3) -> pd.DataFrame:
     logger.error(f"Failed fetching COT data for {market_name} after {max_attempts} attempts.")
     return pd.DataFrame()
 
-# --- Fetch Price Data (yahooquery) ---
-def fetch_yahooquery_data(ticker: str, start_date: str, end_date: str, max_attempts: int = 3) -> pd.DataFrame:
-    logger.info(f"Fetching Yahoo data for {ticker} from {start_date} to {end_date}")
+# --- Fetch Price Data ---
+@st.cache_data(ttl=3600)
+def fetch_yahooquery_data(ticker: str, max_attempts: int = 3) -> pd.DataFrame:
+    logger.info(f"Fetching Yahoo data for {ticker}")
+    start_date = (datetime.datetime.now() - datetime.timedelta(days=730)).strftime("%Y-%m-%d")
+    end_date = datetime.datetime.now().strftime("%Y-%m-%d")
+    
     attempt = 0
     while attempt < max_attempts:
         try:
@@ -153,6 +155,8 @@ def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if vol_col is not None:
         rolling_avg = df[vol_col].rolling(20).mean()
         df["rvol"] = df[vol_col] / rolling_avg
+    else:
+        df["rvol"] = np.nan
     
     # Calculate RSI
     delta = df[close_col].diff()
@@ -223,7 +227,7 @@ def merge_cot_price(cot_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFram
     
     merged = pd.merge(price_df, cot_df_filled, on="date", how="left")
     
-    # Forward fill COT data (carried forward until next COT report)
+    # Forward fill COT data
     for col in cot_columns[1:]:
         merged[col] = merged[col].ffill()
     
@@ -234,7 +238,6 @@ def calculate_health_gauge(merged_df: pd.DataFrame) -> float:
     if merged_df.empty:
         return np.nan
     
-    # Get latest data
     latest = merged_df.tail(1).iloc[0]
     recent = merged_df.tail(90).copy()
     
@@ -245,10 +248,8 @@ def calculate_health_gauge(merged_df: pd.DataFrame) -> float:
     
     scores = []
     
-    # 1. Commercial net position extreme score (25%)
+    # 1. Commercial net position score (25%)
     if "commercial_net_zscore" in latest and not pd.isna(latest["commercial_net_zscore"]):
-        # Commercials are smart money - going against the crowd
-        # Higher score when commercials are net long against the crowd (negative z-score)
         comm_score = max(0, min(1, 0.5 - latest["commercial_net_zscore"]/4))
         scores.append((comm_score, 0.25))
     
@@ -256,74 +257,56 @@ def calculate_health_gauge(merged_df: pd.DataFrame) -> float:
     if all(x in recent.columns for x in [close_col, "sma20", "sma50", "sma200"]):
         last_close = latest[close_col]
         trend_signals = [
-            last_close > latest["sma20"],  # Above 20-day MA
-            latest["sma20"] > latest["sma50"],  # 20-day MA above 50-day MA
-            latest["sma50"] > latest["sma200"],  # 50-day MA above 200-day MA
+            last_close > latest["sma20"],
+            latest["sma20"] > latest["sma50"],
+            latest["sma50"] > latest["sma200"],
         ]
         trend_score = sum(trend_signals) / len(trend_signals)
         scores.append((trend_score, 0.20))
     
     # 3. Momentum score (15%)
-    if "rsi" in recent.columns:
-        # RSI score - prefer middle-high range (40-70)
+    if "rsi" in recent.columns and not pd.isna(latest["rsi"]):
         rsi = latest["rsi"]
-        if pd.isna(rsi):
-            rsi_score = 0.5
-        elif rsi < 30:
-            rsi_score = 0.3  # Oversold
+        if rsi < 30:
+            rsi_score = 0.3
         elif rsi > 70:
-            rsi_score = 0.7  # Overbought
+            rsi_score = 0.7
         else:
-            rsi_score = 0.5 + (rsi - 50) / 100  # Linear between 0.5 and 0.7
+            rsi_score = 0.5 + (rsi - 50) / 100
         scores.append((rsi_score, 0.15))
     
     # 4. Volatility and volume score (15%)
     vol_score = 0.5
     if "bb_width" in recent.columns and "rvol" in recent.columns:
-        # Normalize BB width
         bb_width_percentile = stats.percentileofscore(
-            recent["bb_width"].dropna(), latest["bb_width"]) / 100
-        
-        # Higher score for contracting volatility (coiling for move)
+            recent["bb_width"].dropna(), latest["bb_width"]) / 100 if not pd.isna(latest["bb_width"]) else 0.5
         bb_score = 1 - bb_width_percentile
-        
-        # Volume score - recent relative volume
         rvol_score = min(1.0, latest["rvol"] / 2.0) if not pd.isna(latest["rvol"]) else 0.5
-        
         vol_score = 0.7 * bb_score + 0.3 * rvol_score
         scores.append((vol_score, 0.15))
     
     # 5. Distance from 52-week high/low score (15%)
     if "pct_from_52w_high" in recent.columns and "pct_from_52w_low" in recent.columns:
-        # Higher score when closer to 52-week high
         high_score = 1 - (abs(latest["pct_from_52w_high"]) / 100)
         high_score = max(0, min(1, high_score))
-        
-        # Higher score when further from 52-week low
         low_score = min(1, latest["pct_from_52w_low"] / 100)
         low_score = max(0, min(1, low_score))
-        
-        # Combine with preference to high_score
         dist_score = 0.7 * high_score + 0.3 * low_score
         scores.append((dist_score, 0.15))
     
     # 6. Open interest score (10%)
     if "open_interest_all" in recent.columns:
         oi = recent["open_interest_all"].dropna()
-        if not oi.empty:
+        if not oi.empty and not pd.isna(latest["open_interest_all"]):
             oi_pctile = stats.percentileofscore(oi, latest["open_interest_all"]) / 100
-            # Prefer higher open interest
-            oi_score = oi_pctile
-            scores.append((oi_score, 0.10))
+            scores.append((oi_pctile, 0.10))
     
-    # Calculate weighted score
     if not scores:
-        return 5.0  # Neutral if no data
+        return 5.0
     
     weighted_sum = sum(score * weight for score, weight in scores)
     total_weight = sum(weight for _, weight in scores)
     
-    # Scale to 0-10
     health_score = (weighted_sum / total_weight) * 10
     
     return float(health_score)
@@ -344,7 +327,7 @@ def generate_signals(merged_df: pd.DataFrame) -> dict:
     bullish_points = 0
     bearish_points = 0
     
-    # 1. COT commercial position signals
+    # COT commercial position signals
     if "commercial_net_zscore" in latest and not pd.isna(latest["commercial_net_zscore"]):
         if latest["commercial_net_zscore"] < -1.5:
             bullish_points += 2
@@ -359,7 +342,7 @@ def generate_signals(merged_df: pd.DataFrame) -> dict:
             bearish_points += 1
             signal_reasons.append("Commercials moderately net short")
     
-    # 2. Price trend signals
+    # Price trend signals
     if all(x in latest for x in [close_col, "sma20", "sma50", "sma200"]):
         if latest[close_col] > latest["sma20"] > latest["sma50"] > latest["sma200"]:
             bullish_points += 2
@@ -374,7 +357,7 @@ def generate_signals(merged_df: pd.DataFrame) -> dict:
             bearish_points += 1
             signal_reasons.append("Downtrend: price below 50 and 200-day MAs")
     
-    # 3. RSI signals
+    # RSI signals
     if "rsi" in latest and not pd.isna(latest["rsi"]):
         if latest["rsi"] < 30:
             bullish_points += 1
@@ -389,7 +372,7 @@ def generate_signals(merged_df: pd.DataFrame) -> dict:
             bearish_points += 0.5
             signal_reasons.append("RSI approaching overbought")
     
-    # 4. Bollinger Band signals
+    # Bollinger Band signals
     if all(x in latest for x in ["bb_upper", "bb_lower", close_col]):
         if latest[close_col] > latest["bb_upper"]:
             bearish_points += 1
@@ -398,20 +381,18 @@ def generate_signals(merged_df: pd.DataFrame) -> dict:
             bullish_points += 1
             signal_reasons.append("Price below lower Bollinger Band")
     
-    # 5. Volume signals
+    # Volume signals
     if "rvol" in latest and not pd.isna(latest["rvol"]):
-        if latest["rvol"] > 1.5:
-            # Check if volume spike is bullish or bearish
-            if close_col and len(recent) > 1:
-                price_change = latest[close_col] - recent.iloc[-2][close_col]
-                if price_change > 0:
-                    bullish_points += 1
-                    signal_reasons.append("High volume on price advance")
-                elif price_change < 0:
-                    bearish_points += 1
-                    signal_reasons.append("High volume on price decline")
+        if latest["rvol"] > 1.5 and len(recent) > 1:
+            price_change = latest[close_col] - recent.iloc[-2][close_col]
+            if price_change > 0:
+                bullish_points += 1
+                signal_reasons.append("High volume on price advance")
+            elif price_change < 0:
+                bearish_points += 1
+                signal_reasons.append("High volume on price decline")
     
-    # 6. 52-week signals
+    # 52-week signals
     if "pct_from_52w_high" in latest and "pct_from_52w_low" in latest:
         if latest["pct_from_52w_high"] > -5:
             bullish_points += 1
@@ -420,7 +401,7 @@ def generate_signals(merged_df: pd.DataFrame) -> dict:
             bearish_points += 1
             signal_reasons.append("Price near 52-week low")
     
-    # Determine overall signal
+    # Determine signal
     net_score = bullish_points - bearish_points
     
     if net_score >= 3:
@@ -439,259 +420,362 @@ def generate_signals(merged_df: pd.DataFrame) -> dict:
         signal = "NEUTRAL"
         strength = 0
     
-    # Add health score to reasoning
-    if "health_score" in merged_df.columns:
-        health_score = merged_df["health_score"].iloc[-1]
-        signal_reasons.append(f"Health gauge: {health_score:.2f}/10")
-    
     return {
         "signal": signal,
         "strength": strength,
-        "reasoning": "; ".join(signal_reasons)
+        "reasoning": "; ".join(signal_reasons) if signal_reasons else "No strong signals detected"
     }
 
-# --- Calculate RVOL (Relative Volume) ---
-def calculate_rvol(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
-    vol_col = "volume" if "volume" in df.columns else ("Volume" if "Volume" in df.columns else None)
-    if vol_col is None:
-        df["rvol"] = np.nan
-        return df
-    rolling_avg = df[vol_col].rolling(window).mean()
-    df["rvol"] = df[vol_col] / rolling_avg
-    return df
+# --- AI Newsletter Generation ---
+def build_newsletter_prompt(asset: str, signal_data: dict, merged_df: pd.DataFrame) -> str:
+    if merged_df.empty:
+        return f"No data available for {asset}."
+    
+    latest = merged_df.iloc[-1]
+    close_col = "close" if "close" in latest else "Close"
+    
+    prompt = f"""Write a concise professional market analysis for {asset.split(' - ')[0]}.
 
-# --- Generate Advanced Forecasts ---
-def generate_signals(df: pd.DataFrame, cot_df: pd.DataFrame) -> list:
-    signals = []
-    if df is None or df.empty or cot_df is None or cot_df.empty:
-        return signals
+Current Data:
+- Price: ${latest.get(close_col, 0):.2f}
+- RSI: {latest.get('rsi', 0):.1f}
+- Signal: {signal_data['signal']} (Strength: {signal_data['strength']}/5)
+- Key Factors: {signal_data['reasoning']}
+- Commercial Positioning Z-Score: {latest.get('commercial_net_zscore', 0):.2f}
+- 52-Week Range: {latest.get('pct_from_52w_low', 0):.1f}% from low, {latest.get('pct_from_52w_high', 0):.1f}% from high
 
-    latest = df.iloc[-1]
-    cot_latest = cot_df.iloc[-1]
+Write a 3-paragraph analysis covering:
+1. Current market position and trend
+2. Key technical and COT indicators
+3. Trading outlook and risk factors
 
-    # Example trading rules
-    if (
-        latest["rsi"] < 30
-        and latest["close"] > latest["sma50"]
-        and cot_latest["noncomm_positions_change"] > 0
-    ):
-        signals.append(
-            {
-                "signal": "BUY",
-                "reason": "RSI oversold, price above SMA50, non-commercial longs increasing",
-            }
-        )
-    elif (
-        latest["rsi"] > 70
-        and latest["close"] < latest["sma50"]
-        and cot_latest["noncomm_positions_change"] < 0
-    ):
-        signals.append(
-            {
-                "signal": "SELL",
-                "reason": "RSI overbought, price below SMA50, non-commercial longs decreasing",
-            }
-        )
-    else:
-        signals.append(
-            {
-                "signal": "NEUTRAL",
-                "reason": "No strong signal detected",
-            }
-        )
-
-    return signals
-
-
-# --- Relative Volume Calculation ---
-def calculate_rvol(df: pd.DataFrame, lookback: int = 20) -> pd.Series:
-    if "volume" not in df.columns:
-        return pd.Series([np.nan] * len(df), index=df.index)
-    avg_volume = df["volume"].rolling(window=lookback).mean()
-    return df["volume"] / avg_volume
-
-
-# --- Trade Setup Generation ---
-def generate_trade_setup(signal: str, df: pd.DataFrame) -> dict:
-    if df is None or df.empty:
-        return {}
-    latest = df.iloc[-1]
-
-    setup = {"signal": signal}
-    atr = latest.get("atr", np.nan)
-
-    if signal == "BUY":
-        setup["stop_loss"] = latest["close"] - (2 * atr)
-        setup["target"] = latest["close"] + (3 * atr)
-    elif signal == "SELL":
-        setup["stop_loss"] = latest["close"] + (2 * atr)
-        setup["target"] = latest["close"] - (3 * atr)
-    else:
-        setup["stop_loss"] = None
-        setup["target"] = None
-
-    return setup
-
-
-# --- AI Market Newsletter Generation ---
-def build_newsletter_prompt(asset: str, signals: list, df: pd.DataFrame, cot_df: pd.DataFrame) -> str:
-    if df is None or df.empty or cot_df is None or cot_df.empty:
-        return f"No sufficient data available for {asset}."
-
-    latest = df.iloc[-1]
-    cot_latest = cot_df.iloc[-1]
-    signal_texts = [f"{s['signal']} ({s['reason']})" for s in signals]
-
-    prompt = f"""
-    Generate a professional market newsletter for {asset}.
-
-    Key Data:
-    - Latest close price: {latest['close']:.2f}
-    - RSI: {latest['rsi']:.2f}
-    - SMA50: {latest['sma50']:.2f}
-    - SMA200: {latest['sma200']:.2f}
-    - Bollinger Bands: {latest['bb_low']:.2f} – {latest['bb_high']:.2f}
-    - ATR: {latest['atr']:.2f}
-    - Relative Volume: {latest.get('rvol', np.nan):.2f}
-    - 52w High/Low: {latest['52w_low']:.2f} – {latest['52w_high']:.2f}
-
-    Commitment of Traders:
-    - Non-commercial net positions: {cot_latest['noncomm_net']}
-    - Commercial net positions: {cot_latest['commercial_net']}
-
-    Signals: {", ".join(signal_texts)}
-
-    Write in a structured, concise, professional style.
-    """
+Keep it professional and actionable. No fluff."""
+    
     return prompt.strip()
 
-
 def generate_market_newsletter(prompt: str) -> str:
+    if hf_client is None:
+        return "AI newsletter generation unavailable (API key not configured)"
+    
     try:
-        response = hf_client.text_generation(
-            model="mistralai/Mistral-7B-Instruct-v0.3",
-            inputs=prompt,
-            parameters={"max_new_tokens": 500},
+        response = hf_client.chat_completion(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=500,
+            temperature=0.7
         )
-        return response.get("generated_text", "").strip()
+        return response.choices[0].message.content.strip()
     except Exception as e:
         logger.error(f"Newsletter generation failed: {e}")
-        return "Error generating newsletter."
-
+        return f"Error generating newsletter: {str(e)}"
 
 # --- Visualization ---
-def create_asset_chart(df: pd.DataFrame, cot_df: pd.DataFrame, asset_name: str):
+def create_asset_chart(merged_df: pd.DataFrame, asset_name: str):
+    if merged_df.empty:
+        return None
+    
+    close_col = "close" if "close" in merged_df.columns else "Close"
+    high_col = "high" if "high" in merged_df.columns else "High"
+    low_col = "low" if "low" in merged_df.columns else "Low"
+    open_col = "open" if "open" in merged_df.columns else "Open"
+    
     fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True,
-        row_heights=[0.7, 0.3],
-        vertical_spacing=0.05,
-        subplot_titles=(f"{asset_name} Price & Indicators", "COT Non-Commercial Net Positions")
+        rows=3, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.5, 0.25, 0.25],
+        vertical_spacing=0.03,
+        subplot_titles=(
+            f"{asset_name.split(' - ')[0]} Price Analysis",
+            "RSI",
+            "COT Commercial Net Position Z-Score"
+        )
     )
-
-    # Candlestick chart
+    
+    # Candlestick
     fig.add_trace(go.Candlestick(
-        x=df.index, open=df["open"], high=df["high"],
-        low=df["low"], close=df["close"], name="Price"
+        x=merged_df["date"],
+        open=merged_df[open_col],
+        high=merged_df[high_col],
+        low=merged_df[low_col],
+        close=merged_df[close_col],
+        name="Price"
     ), row=1, col=1)
-
+    
     # Moving averages
-    fig.add_trace(go.Scatter(x=df.index, y=df["sma50"], mode="lines", name="SMA50"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df["sma200"], mode="lines", name="SMA200"), row=1, col=1)
-
+    fig.add_trace(go.Scatter(
+        x=merged_df["date"], y=merged_df["sma50"],
+        mode="lines", name="SMA50", line=dict(color="orange", width=1)
+    ), row=1, col=1)
+    
+    fig.add_trace(go.Scatter(
+        x=merged_df["date"], y=merged_df["sma200"],
+        mode="lines", name="SMA200", line=dict(color="red", width=1)
+    ), row=1, col=1)
+    
     # Bollinger Bands
-    fig.add_trace(go.Scatter(x=df.index, y=df["bb_high"], mode="lines", line=dict(width=1), name="BB High"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df["bb_low"], mode="lines", line=dict(width=1), name="BB Low"), row=1, col=1)
-
-    # COT Net Positions
-    fig.add_trace(go.Bar(x=cot_df.index, y=cot_df["noncomm_net"], name="Non-Comm Net"), row=2, col=1)
-
-    fig.update_layout(template="plotly_dark", height=800)
+    fig.add_trace(go.Scatter(
+        x=merged_df["date"], y=merged_df["bb_upper"],
+        mode="lines", name="BB Upper", line=dict(color="gray", width=1, dash="dash"),
+        showlegend=False
+    ), row=1, col=1)
+    
+    fig.add_trace(go.Scatter(
+        x=merged_df["date"], y=merged_df["bb_lower"],
+        mode="lines", name="BB Lower", line=dict(color="gray", width=1, dash="dash"),
+        fill='tonexty', fillcolor='rgba(128,128,128,0.1)',
+        showlegend=False
+    ), row=1, col=1)
+    
+    # RSI
+    fig.add_trace(go.Scatter(
+        x=merged_df["date"], y=merged_df["rsi"],
+        mode="lines", name="RSI", line=dict(color="purple")
+    ), row=2, col=1)
+    
+    fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1, opacity=0.5)
+    fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1, opacity=0.5)
+    
+    # COT Z-Score
+    fig.add_trace(go.Scatter(
+        x=merged_df["date"], y=merged_df["commercial_net_zscore"],
+        mode="lines", name="Commercial Z-Score", line=dict(color="blue")
+    ), row=3, col=1)
+    
+    fig.add_hline(y=0, line_dash="solid", line_color="white", row=3, col=1, opacity=0.3)
+    fig.add_hline(y=1.5, line_dash="dash", line_color="red", row=3, col=1, opacity=0.5)
+    fig.add_hline(y=-1.5, line_dash="dash", line_color="green", row=3, col=1, opacity=0.5)
+    
+    fig.update_layout(
+        template="plotly_dark",
+        height=900,
+        showlegend=True,
+        hovermode="x unified"
+    )
+    
+    fig.update_yaxes(title_text="Price", row=1, col=1)
+    fig.update_yaxes(title_text="RSI", row=2, col=1)
+    fig.update_yaxes(title_text="Z-Score", row=3, col=1)
+    
     return fig
-
-
-# --- Opportunity Dashboard ---
-def create_opportunity_dashboard(opportunities: dict):
-    df = pd.DataFrame(opportunities).T
-    df["health_gauge"] = df["health_gauge"].astype(float)
-    df = df.sort_values(by="health_gauge", ascending=False)
-    return df
 
 # --- Streamlit App ---
 def main():
-    st.set_page_config(page_title="Market Dashboard", layout="wide")
-    st.title("📊 Market Intelligence Dashboard")
-
-    # Sidebar
-    st.sidebar.header("Controls")
-    selected_date = st.sidebar.date_input("Select Date", datetime.date.today())
-    refresh_data = st.sidebar.button("🔄 Refresh Data")
-    report_type = st.sidebar.selectbox("Report Type", ["Dashboard", "Detailed Analysis", "Newsletter"])
-
-    # Newsletter generation option
-    if st.sidebar.button("📰 Generate Newsletter"):
-        st.session_state["generate_newsletter"] = True
-
-    # Fetch & process data
-    opportunities = {}
-    for cot_name, ticker in ASSET_MAPPING.items():
-        cot_df = fetch_cot_data(cot_name)
-        price_df = fetch_yahooquery_data(ticker)
-        if cot_df is None or price_df is None:
-            continue
-
-        merged_df = merge_cot_price(cot_df, price_df)
-        if merged_df is None or merged_df.empty:
-            continue
-
-        health = calculate_health_gauge(cot_df, price_df)
-        signals = generate_signals(merged_df, cot_df)
-        trade_setup = generate_trade_setup(signals[0]["signal"], merged_df) if signals else {}
-
-        opportunities[cot_name] = {
-            "ticker": ticker,
-            "health_gauge": health,
-            "signals": signals,
-            "trade_setup": trade_setup,
-            "cot_df": cot_df,
-            "price_df": merged_df,
+    st.set_page_config(page_title="Market Intelligence Dashboard", layout="wide", page_icon="📊")
+    
+    # Custom CSS
+    st.markdown("""
+        <style>
+        .big-font {
+            font-size:20px !important;
+            font-weight: bold;
         }
-
-    # Tabs
-    tabs = st.tabs(["📈 Market Dashboard", "🔍 Detailed Analysis", "📰 Market Newsletter"])
-
+        .metric-card {
+            background-color: #1e1e1e;
+            padding: 20px;
+            border-radius: 10px;
+            border: 1px solid #333;
+        }
+        .newsletter-section {
+            background-color: #2d2d2d;
+            padding: 20px;
+            border-radius: 10px;
+            margin: 10px 0;
+            border-left: 4px solid #4CAF50;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+    
+    st.title("📊 Market Intelligence Dashboard")
+    st.markdown("*Real-time COT analysis with AI-powered insights*")
+    
+    # Sidebar
+    st.sidebar.header("⚙️ Controls")
+    
+    # Select assets to analyze
+    selected_assets = st.sidebar.multiselect(
+        "Select Assets to Analyze",
+        list(ASSET_MAPPING.keys()),
+        default=list(ASSET_MAPPING.keys())[:5]
+    )
+    
+    if not selected_assets:
+        st.warning("Please select at least one asset to analyze")
+        return
+    
+    refresh_data = st.sidebar.button("🔄 Refresh All Data", type="primary")
+    
+    # Clear cache if refresh requested
+    if refresh_data:
+        st.cache_data.clear()
+        st.rerun()
+    
+    # Main content
+    tab1, tab2, tab3 = st.tabs(["📈 Dashboard", "🔍 Detailed Analysis", "📰 AI Newsletter"])
+    
+    # Fetch data with progress bar
+    with st.spinner("Fetching market data..."):
+        progress_bar = st.progress(0)
+        opportunities = {}
+        
+        for idx, cot_name in enumerate(selected_assets):
+            ticker = ASSET_MAPPING[cot_name]
+            
+            try:
+                # Fetch data
+                cot_df = fetch_cot_data(cot_name)
+                price_df = fetch_yahooquery_data(ticker)
+                
+                if cot_df.empty or price_df.empty:
+                    logger.warning(f"Skipping {cot_name} - insufficient data")
+                    continue
+                
+                # Merge and analyze
+                merged_df = merge_cot_price(cot_df, price_df)
+                if merged_df.empty:
+                    continue
+                
+                health = calculate_health_gauge(merged_df)
+                signals = generate_signals(merged_df)
+                
+                opportunities[cot_name] = {
+                    "ticker": ticker,
+                    "health_gauge": health,
+                    "signal": signals["signal"],
+                    "signal_strength": signals["strength"],
+                    "signal_reasoning": signals["reasoning"],
+                    "merged_df": merged_df,
+                    "latest_price": merged_df.iloc[-1].get("close", merged_df.iloc[-1].get("Close", 0)),
+                }
+                
+            except Exception as e:
+                logger.error(f"Error processing {cot_name}: {e}")
+                continue
+            
+            progress_bar.progress((idx + 1) / len(selected_assets))
+        
+        progress_bar.empty()
+    
+    if not opportunities:
+        st.error("No data available for selected assets. Please try different selections.")
+        return
+    
     # --- Dashboard Tab ---
-    with tabs[0]:
-        st.subheader("Market Opportunities")
-        dashboard_df = create_opportunity_dashboard(opportunities)
-        st.dataframe(dashboard_df[["health_gauge"]])
-
+    with tab1:
+        st.subheader("Market Opportunity Dashboard")
+        
+        # Create dashboard dataframe
+        dashboard_data = []
+        for asset, data in opportunities.items():
+            dashboard_data.append({
+                "Asset": asset.split(" - ")[0],
+                "Price": f"${data['latest_price']:.2f}",
+                "Health Score": f"{data['health_gauge']:.1f}/10",
+                "Signal": data['signal'],
+                "Strength": "⭐" * data['signal_strength'],
+            })
+        
+        df_display = pd.DataFrame(dashboard_data)
+        
+        # Color code signals
+        def color_signal(val):
+            if "BUY" in val:
+                return 'background-color: #1e4620; color: white'
+            elif "SELL" in val:
+                return 'background-color: #4a1a1a; color: white'
+            else:
+                return 'background-color: #3a3a3a; color: white'
+        
+        styled_df = df_display.style.applymap(color_signal, subset=['Signal'])
+        st.dataframe(styled_df, use_container_width=True, height=400)
+        
+        # Top opportunities
+        st.subheader("🎯 Top Opportunities")
+        sorted_opps = sorted(opportunities.items(), key=lambda x: x[1]['health_gauge'], reverse=True)
+        
+        cols = st.columns(min(3, len(sorted_opps)))
+        for idx, (asset, data) in enumerate(sorted_opps[:3]):
+            with cols[idx]:
+                st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+                st.metric(
+                    label=asset.split(" - ")[0],
+                    value=f"${data['latest_price']:.2f}",
+                    delta=f"Health: {data['health_gauge']:.1f}/10"
+                )
+                st.markdown(f"**{data['signal']}** {'⭐' * data['signal_strength']}")
+                st.markdown('</div>', unsafe_allow_html=True)
+    
     # --- Detailed Analysis Tab ---
-    with tabs[1]:
-        asset_choice = st.selectbox("Select Asset", list(opportunities.keys()))
-        asset_data = opportunities[asset_choice]
-        fig = create_asset_chart(asset_data["price_df"], asset_data["cot_df"], asset_choice)
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.write("**Signals:**", asset_data["signals"])
-        st.write("**Trade Setup:**", asset_data["trade_setup"])
-        st.write("**COT Latest:**", asset_data["cot_df"].tail(1).T)
-        st.write("**Technical Indicators:**", asset_data["price_df"].tail(1).T)
-
+    with tab2:
+        st.subheader("Detailed Technical Analysis")
+        
+        selected_asset = st.selectbox(
+            "Select Asset for Detailed View",
+            list(opportunities.keys()),
+            format_func=lambda x: x.split(" - ")[0]
+        )
+        
+        if selected_asset:
+            data = opportunities[selected_asset]
+            
+            # Key metrics
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Current Price", f"${data['latest_price']:.2f}")
+            with col2:
+                st.metric("Health Score", f"{data['health_gauge']:.1f}/10")
+            with col3:
+                st.metric("Signal", data['signal'])
+            with col4:
+                st.metric("Strength", "⭐" * data['signal_strength'])
+            
+            st.markdown(f"**Analysis:** {data['signal_reasoning']}")
+            
+            # Chart
+            fig = create_asset_chart(data['merged_df'], selected_asset)
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
+            
+            # Latest technical indicators
+            st.subheader("Technical Indicators")
+            latest = data['merged_df'].iloc[-1]
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("**Trend Indicators**")
+                st.write(f"• RSI: {latest.get('rsi', 0):.1f}")
+                st.write(f"• SMA 20: ${latest.get('sma20', 0):.2f}")
+                st.write(f"• SMA 50: ${latest.get('sma50', 0):.2f}")
+                st.write(f"• SMA 200: ${latest.get('sma200', 0):.2f}")
+            
+            with col2:
+                st.markdown("**COT & Volatility**")
+                st.write(f"• Commercial Z-Score: {latest.get('commercial_net_zscore', 0):.2f}")
+                st.write(f"• Volatility: {latest.get('volatility', 0):.1f}%")
+                st.write(f"• ATR: ${latest.get('atr14', 0):.2f}")
+                st.write(f"• From 52W High: {latest.get('pct_from_52w_high', 0):.1f}%")
+    
     # --- Newsletter Tab ---
-    with tabs[2]:
-        if "generate_newsletter" in st.session_state and st.session_state["generate_newsletter"]:
-            st.subheader("Generated Market Newsletter")
-
-            all_newsletters = []
-            for asset, data in opportunities.items():
-                prompt = build_newsletter_prompt(asset, data["signals"], data["price_df"], data["cot_df"])
-                newsletter = generate_market_newsletter(prompt)
-                all_newsletters.append(f"### {asset}\n{newsletter}\n")
-
-            st.markdown("\n\n".join(all_newsletters))
+    with tab3:
+        st.subheader("📰 AI-Generated Market Newsletter")
+        st.markdown(f"*Generated on {datetime.datetime.now().strftime('%B %d, %Y at %I:%M %p')}*")
+        
+        if st.button("🤖 Generate Newsletter", type="primary"):
+            with st.spinner("Generating AI analysis..."):
+                for asset, data in opportunities.items():
+                    st.markdown('<div class="newsletter-section">', unsafe_allow_html=True)
+                    st.markdown(f"### 📊 {asset.split(' - ')[0]}")
+                    st.markdown(f"**Current Price:** ${data['latest_price']:.2f} | **Signal:** {data['signal']} {'⭐' * data['signal_strength']} | **Health:** {data['health_gauge']:.1f}/10")
+                    st.markdown("---")
+                    
+                    prompt = build_newsletter_prompt(asset, 
+                        {"signal": data['signal'], "strength": data['signal_strength'], "reasoning": data['signal_reasoning']},
+                        data['merged_df'])
+                    
+                    newsletter = generate_market_newsletter(prompt)
+                    st.markdown(newsletter)
+                    st.markdown('</div>', unsafe_allow_html=True)
+                    st.markdown("")
         else:
-            st.info("Click '📰 Generate Newsletter' in the sidebar to create a report.")
-
+            st.info("Click 'Generate Newsletter' to create AI-powered market analysis for all selected assets")
 
 if __name__ == "__main__":
     main()
