@@ -9,8 +9,10 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from sodapy import Socrata
 from yahooquery import Ticker
-from huggingface_hub import InferenceClient
 from scipy import stats
+
+# NEW: OpenAI-compatible client to route to Hugging Face router
+from openai import OpenAI
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO)
@@ -20,12 +22,45 @@ logger = logging.getLogger(__name__)
 SODAPY_APP_TOKEN = "PP3ezxaUTiGforvvbBUGzwRx7"
 client = Socrata("publicreporting.cftc.gov", SODAPY_APP_TOKEN, timeout=60)
 
-# Initialize HF client once
+# ---- Insert / replace your HF client init with this block ----
+HF_MODEL_ID = "meta-llama/Llama-3.3-70B-Instruct"
+HF_TOKEN = os.environ.get("HF_TOKEN")  # ensure this is exported in your env
+
+# tiny wrapper so your existing generate_market_newsletter() doesn't change
+class _HFClientWrapper:
+    def __init__(self, openai_client, model_id):
+        self._client = openai_client
+        self._model = model_id
+
+    def chat_completion(self, messages, max_tokens=500, temperature=0.7, **kwargs):
+        """
+        Mirrors the minimal call shape your function expects.
+        Forwards call to OpenAI(client) -> HF router.
+        """
+        return self._client.chat.completions.create(
+            model=self._model,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            **kwargs
+        )
+
+# Initialize OpenAI client pointed at Hugging Face router
 try:
-    hf_client = InferenceClient(api_key=os.getenv("HF_TOKEN"))
-except:
+    if not HF_TOKEN:
+        raise RuntimeError("HF_TOKEN environment variable not set")
+
+    _openai_hf = OpenAI(
+        base_url="https://router.huggingface.co/v1",
+        api_key=HF_TOKEN,
+    )
+    hf_client = _HFClientWrapper(_openai_hf, HF_MODEL_ID)
+    logging.getLogger(__name__).info(f"hf_client initialized and locked to model: {HF_MODEL_ID}")
+
+except Exception as e:
     hf_client = None
-    logger.warning("HF client not initialized - newsletter generation may not work")
+    logging.getLogger(__name__).warning(f"hf_client not initialized: {e}")
+# ---------------------------------------------------------------
 
 # --- Asset mapping (COT market names -> Yahoo futures tickers) ---
 ASSET_MAPPING = {
@@ -434,7 +469,7 @@ def build_newsletter_prompt(asset: str, signal_data: dict, merged_df: pd.DataFra
     latest = merged_df.iloc[-1]
     close_col = "close" if "close" in latest else "Close"
     
-    prompt = f"""Write a concise professional market analysis for {asset.split(' - ')[0]}.
+    prompt = f\"\"\"Write a concise professional market analysis for {asset.split(' - ')[0]}.
 
 Current Data:
 - Price: ${latest.get(close_col, 0):.2f}
@@ -449,7 +484,7 @@ Write a 3-paragraph analysis covering:
 2. Key technical and COT indicators
 3. Trading outlook and risk factors
 
-Keep it professional and actionable. No fluff."""
+Keep it professional and actionable. No fluff.\"\"\"
     
     return prompt.strip()
 
